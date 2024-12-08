@@ -160,7 +160,7 @@ impl Project {
     async fn init_repos(
         &mut self,
         store: &Store,
-        reporter: &dyn HookInitReporter,
+        reporter: Option<&dyn HookInitReporter>,
     ) -> Result<(), Error> {
         let mut tasks = FuturesUnordered::new();
         let mut seen = HashSet::new();
@@ -170,9 +170,14 @@ impl Project {
                     continue;
                 }
                 tasks.push(async move {
-                    let progress = reporter.on_clone_start(&format!("{repo}"));
+                    let progress = reporter
+                        .map(|reporter| (reporter, reporter.on_clone_start(&format!("{repo}"))));
+
                     let path = store.prepare_remote_repo(repo, &[]).await;
-                    reporter.on_clone_complete(progress);
+
+                    if let Some((reporter, progress)) = progress {
+                        reporter.on_clone_complete(progress);
+                    }
 
                     (repo, path)
                 });
@@ -217,7 +222,7 @@ impl Project {
     pub async fn init_hooks(
         &mut self,
         store: &Store,
-        reporter: &dyn HookInitReporter,
+        reporter: Option<&dyn HookInitReporter>,
     ) -> Result<Vec<Hook>, Error> {
         self.init_repos(store, reporter).await?;
 
@@ -296,7 +301,7 @@ impl Project {
             }
         }
 
-        reporter.on_complete();
+        reporter.map(HookInitReporter::on_complete);
 
         Ok(hooks)
     }
