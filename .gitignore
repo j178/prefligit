@@ -13,3 +13,6 @@
 
 # profiling flamegraphs
 *.flamegraph.svg
+
+# claude settings
+.claude

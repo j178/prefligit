@@ -4,7 +4,7 @@ use std::ops::RangeInclusive;
 use std::path::Path;
 use std::str::FromStr;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use fancy_regex as regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use url::Url;
@@ -206,8 +206,7 @@ impl Stage {
 // TODO: warn deprecated stage
 // TODO: warn sensible regex
 // TODO: check minimum_pre_commit_version
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub struct Config {
     pub repos: Vec<Repo>,
     /// A list of --hook-types which will be used by default when running pre-commit install.
@@ -228,6 +227,49 @@ pub struct Config {
     pub minimum_pre_commit_version: Option<String>,
     /// Configuration for pre-commit.ci service.
     pub ci: Option<HashMap<String, serde_yaml::Value>>,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        struct ConfigWire {
+            repos: Vec<serde_yaml::Value>,
+            default_install_hook_types: Option<Vec<HookType>>,
+            default_language_version: Option<HashMap<Language, String>>,
+            default_stages: Option<Vec<Stage>>,
+            files: Option<String>,
+            exclude: Option<String>,
+            fail_fast: Option<bool>,
+            minimum_pre_commit_version: Option<String>,
+            ci: Option<HashMap<String, serde_yaml::Value>>,
+        }
+
+        let config_wire = ConfigWire::deserialize(deserializer)?;
+
+        let mut repos = Vec::new();
+        for (index, repo_value) in config_wire.repos.into_iter().enumerate() {
+            let repo = Repo::deserialize(repo_value).map_err(|e| {
+                serde::de::Error::custom(format!("Failed to parse repo at index {index}: {e}"))
+            })?;
+            repos.push(repo);
+        }
+
+        Ok(Config {
+            repos,
+            default_install_hook_types: config_wire.default_install_hook_types,
+            default_language_version: config_wire.default_language_version,
+            default_stages: config_wire.default_stages,
+            files: config_wire.files,
+            exclude: config_wire.exclude,
+            fail_fast: config_wire.fail_fast,
+            minimum_pre_commit_version: config_wire.minimum_pre_commit_version,
+            ci: config_wire.ci,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -433,16 +475,26 @@ impl<'de> Deserialize<'de> for MetaHook {
         let hook = RemoteHook::deserialize(deserializer)?;
 
         let id = MetaHookID::from_str(&hook.id)
-            .map_err(|()| serde::de::Error::custom("Unknown meta hook id"))?;
+            .map_err(|()| {
+                serde::de::Error::custom(format!(
+                    "Unknown meta hook id `{}`. Valid meta hook ids are: `check-hooks-apply`, `check-useless-excludes`, `identity`",
+                    hook.id
+                ))
+            })?;
+
         if hook.language.is_some_and(|l| l != Language::System) {
-            return Err(serde::de::Error::custom(
-                "language must be system for meta hook",
-            ));
+            return Err(serde::de::Error::custom(format!(
+                "Invalid `language` `{}` for meta hook `{}`: language must be `system` for meta hooks",
+                hook.language.unwrap(),
+                hook.id
+            )));
         }
+
         if hook.entry.is_some() {
-            return Err(serde::de::Error::custom(
-                "entry is not allowed for meta hook",
-            ));
+            return Err(serde::de::Error::custom(format!(
+                "`entry` field is not allowed for meta hook `{}`: meta hooks have predefined entry points",
+                hook.id
+            )));
         }
 
         let mut defaults = match id {
@@ -575,11 +627,14 @@ impl<'de> Deserialize<'de> for Repo {
                 #[derive(Deserialize)]
                 struct _RemoteRepo {
                     rev: String,
-                    hooks: Vec<RemoteHook>,
+                    hooks: Vec<RemoteHookWithContext>,
                 }
-                let _RemoteRepo { rev, hooks } = _RemoteRepo::deserialize(rest)
-                    .map_err(|e| serde::de::Error::custom(format!("Invalid remote repo: {e}")))?;
 
+                let _RemoteRepo { rev, hooks } = _RemoteRepo::deserialize(rest).map_err(|e| {
+                    serde::de::Error::custom(format!("Invalid remote repo `{url}`: {e}"))
+                })?;
+
+                let hooks = hooks.into_iter().map(|h| h.hook).collect();
                 Ok(Repo::Remote(RemoteRepo {
                     repo: url,
                     rev,
@@ -590,20 +645,26 @@ impl<'de> Deserialize<'de> for Repo {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct _LocalRepo {
-                    hooks: Vec<LocalHook>,
+                    hooks: Vec<LocalHookWithContext>,
                 }
+
                 let _LocalRepo { hooks } = _LocalRepo::deserialize(rest)
                     .map_err(|e| serde::de::Error::custom(format!("Invalid local repo: {e}")))?;
+
+                let hooks = hooks.into_iter().map(|h| h.hook).collect();
                 Ok(Repo::Local(LocalRepo { hooks }))
             }
             RepoLocation::Meta => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
                 struct _MetaRepo {
-                    hooks: Vec<MetaHook>,
+                    hooks: Vec<MetaHookWithContext>,
                 }
+
                 let _MetaRepo { hooks } = _MetaRepo::deserialize(rest)
                     .map_err(|e| serde::de::Error::custom(format!("Invalid meta repo: {e}")))?;
+
+                let hooks = hooks.into_iter().map(|h| h.hook).collect();
                 Ok(Repo::Meta(MetaRepo { hooks }))
             }
         }
@@ -634,17 +695,34 @@ pub struct Manifest {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Config file not found: {0}")]
-    NotFound(String),
-
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("Failed to parse `{0}`")]
-    Yaml(String, #[source] serde_yaml::Error),
+    #[error("Config file `{0}` not found")]
+    NotFound(String),
 
-    #[error("Invalid repo URL: {0}")]
-    RepoUrl(#[from] url::ParseError),
+    #[error("Invalid config file `{0}`")]
+    InvalidConfig(String, #[source] anyhow::Error),
+
+    #[error("Failed to parse repo at index {repo_index}: {message}")]
+    RepoParse {
+        repo_index: usize,
+        message: String,
+        #[source]
+        source: Option<serde_yaml::Error>,
+    },
+
+    #[error("Failed to parse hook `{hook_id}` in repo {repo_context}: {message}")]
+    HookParse {
+        hook_id: String,
+        repo_context: String,
+        message: String,
+        #[source]
+        source: Option<serde_yaml::Error>,
+    },
+
+    #[error("Invalid meta hook '{hook_id}': {message}")]
+    MetaHook { hook_id: String, message: String },
 }
 
 /// Read the configuration file from the given path.
@@ -657,7 +735,7 @@ pub fn read_config(path: &Path) -> Result<Config, Error> {
         Err(e) => return Err(e.into()),
     };
     let config = serde_yaml::from_str(&content)
-        .map_err(|e| Error::Yaml(path.user_display().to_string(), e))?;
+        .map_err(|e| Error::InvalidConfig(path.user_display().to_string(), anyhow!(e)))?;
     Ok(config)
 }
 
@@ -665,8 +743,133 @@ pub fn read_config(path: &Path) -> Result<Config, Error> {
 pub fn read_manifest(path: &Path) -> Result<Manifest, Error> {
     let content = fs_err::read_to_string(path)?;
     let manifest = serde_yaml::from_str(&content)
-        .map_err(|e| Error::Yaml(path.user_display().to_string(), e))?;
+        .map_err(|e| Error::InvalidConfig(path.user_display().to_string(), anyhow!(e)))?;
     Ok(manifest)
+}
+
+/// Helper trait to provide better context for deserialization errors
+trait DeserializeWithContext<'de>: Sized {
+    fn deserialize_with_context<D>(deserializer: D, context: &str) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>;
+}
+
+/// Wrapper to add context to deserialization errors
+struct ContextDeserializer<D> {
+    deserializer: D,
+    context: String,
+}
+
+impl<D> ContextDeserializer<D> {
+    fn new(deserializer: D, context: impl Into<String>) -> Self {
+        Self {
+            deserializer,
+            context: context.into(),
+        }
+    }
+}
+
+impl<'de, D> Deserializer<'de> for ContextDeserializer<D>
+where
+    D: Deserializer<'de>,
+{
+    type Error = D::Error;
+
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value, Self::Error>
+    where
+        V: serde::de::Visitor<'de>,
+    {
+        self.deserializer
+            .deserialize_any(visitor)
+            .map_err(|e| serde::de::Error::custom(format!("{}: {}", self.context, e)))
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+        bytes byte_buf option unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
+    }
+}
+
+/// Wrapper for hooks to provide context during deserialization
+#[derive(Debug)]
+struct RemoteHookWithContext {
+    hook: RemoteHook,
+}
+
+impl<'de> Deserialize<'de> for RemoteHookWithContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // First try to get the hook ID for better error context
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let hook_id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let hook = RemoteHook::deserialize(value).map_err(|e| {
+            serde::de::Error::custom(format!("Failed to parse remote hook `{hook_id}`: {e}"))
+        })?;
+
+        Ok(RemoteHookWithContext { hook })
+    }
+}
+
+/// Wrapper for local hooks to provide context during deserialization
+#[derive(Debug)]
+struct LocalHookWithContext {
+    hook: LocalHook,
+}
+
+impl<'de> Deserialize<'de> for LocalHookWithContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // First try to get the hook ID for better error context
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let hook_id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let hook = LocalHook::deserialize(value).map_err(|e| {
+            serde::de::Error::custom(format!("Failed to parse local hook `{hook_id}`: {e}"))
+        })?;
+
+        Ok(LocalHookWithContext { hook })
+    }
+}
+
+/// Wrapper for meta hooks to provide context during deserialization
+#[derive(Debug)]
+struct MetaHookWithContext {
+    hook: MetaHook,
+}
+
+impl<'de> Deserialize<'de> for MetaHookWithContext {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // First try to get the hook ID for better error context
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        let hook_id = value
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unknown>")
+            .to_string();
+
+        let hook = MetaHook::deserialize(value).map_err(|e| {
+            serde::de::Error::custom(format!("Failed to parse meta hook `{hook_id}`: {e}"))
+        })?;
+
+        Ok(MetaHookWithContext { hook })
+    }
 }
 
 #[cfg(test)]
@@ -746,11 +949,11 @@ mod tests {
                       - rust
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid local repo: unknown field `rev`, expected `hooks`", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid local repo: unknown field `rev`, expected `hooks`"),
         )
-        "###);
+        "#);
 
         // Remote hook should have `rev`.
         let yaml = indoc::indoc! {r"
@@ -833,11 +1036,28 @@ mod tests {
                   - id: typos
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid remote repo: missing field `rev`", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid remote repo `https://github.com/crate-ci/typos`: missing field `rev`"),
         )
-        "###);
+        "#);
+
+        // Invalid repo url
+        let yaml = indoc::indoc! {r"
+            repos:
+              - repo: 'http: //hello/world'
+                hooks:
+                  - id: cargo-fmt
+                    name: cargo fmt
+                    entry: cargo fmt --
+                    language: system
+        "};
+        let result = serde_yaml::from_str::<Config>(yaml);
+        insta::assert_debug_snapshot!(result, @r#"
+        Err(
+            Error("Failed to parse repo at index 0: invalid international domain name"),
+        )
+        "#);
     }
 
     #[test]
@@ -852,11 +1072,11 @@ mod tests {
                     alias: typo
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid remote repo: missing field `id`", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid remote repo `https://github.com/crate-ci/typos`: Failed to parse remote hook `<unknown>`: missing field `id`"),
         )
-        "###);
+        "#);
 
         // Local hook should have `id`, `name`, and `entry` and `language`.
         let yaml = indoc::indoc! { r"
@@ -870,11 +1090,11 @@ mod tests {
                       - rust
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid local repo: missing field `language`", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid local repo: Failed to parse local hook `cargo-fmt`: missing field `language`"),
         )
-        "###);
+        "#);
 
         let yaml = indoc::indoc! { r"
             repos:
@@ -948,11 +1168,11 @@ mod tests {
                     alias: typo
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid meta repo: unknown field `rev`, expected `hooks`", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid meta repo: unknown field `rev`, expected `hooks`"),
         )
-        "###);
+        "#);
 
         // Invalid meta hook id
         let yaml = indoc::indoc! { r"
@@ -962,11 +1182,11 @@ mod tests {
                   - id: hello
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid meta repo: Unknown meta hook id", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid meta repo: Failed to parse meta hook `hello`: Unknown meta hook id `hello`. Valid meta hook ids are: `check-hooks-apply`, `check-useless-excludes`, `identity`"),
         )
-        "###);
+        "#);
 
         // Invalid language
         let yaml = indoc::indoc! { r"
@@ -977,11 +1197,11 @@ mod tests {
                     language: python
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid meta repo: language must be system for meta hook", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid meta repo: Failed to parse meta hook `check-hooks-apply`: Invalid `language` `python` for meta hook `check-hooks-apply`: language must be `system` for meta hooks"),
         )
-        "###);
+        "#);
 
         // Invalid entry
         let yaml = indoc::indoc! { r"
@@ -992,11 +1212,11 @@ mod tests {
                     entry: echo hell world
         "};
         let result = serde_yaml::from_str::<Config>(yaml);
-        insta::assert_debug_snapshot!(result, @r###"
+        insta::assert_debug_snapshot!(result, @r#"
         Err(
-            Error("repos: Invalid meta repo: entry is not allowed for meta hook", line: 2, column: 3),
+            Error("Failed to parse repo at index 0: Invalid meta repo: Failed to parse meta hook `check-hooks-apply`: `entry` field is not allowed for meta hook `check-hooks-apply`: meta hooks have predefined entry points"),
         )
-        "###);
+        "#);
 
         // Valid meta hook
         let yaml = indoc::indoc! { r"

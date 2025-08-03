@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indoc::indoc;
 use owo_colors::OwoColorize;
 use same_file::is_same_file;
@@ -71,7 +71,10 @@ pub(crate) async fn install_hooks(config: Option<PathBuf>, printer: Printer) -> 
     let _lock = store.lock_async().await?;
 
     let reporter = HookInitReporter::from(printer);
-    let hooks = project.init_hooks(&store, Some(&reporter)).await?;
+    let hooks = project
+        .init_hooks(&store, Some(&reporter))
+        .await
+        .context("Failed to init hooks")?;
     let reporter = HookInstallReporter::from(printer);
     run::install_hooks(&hooks, &store, &reporter).await?;
 

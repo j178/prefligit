@@ -9,7 +9,6 @@ use anstream::ColorChoice;
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
-use indoc::indoc;
 use itertools::Itertools;
 use owo_colors::{OwoColorize, Style};
 use rand::SeedableRng;
@@ -72,11 +71,9 @@ pub(crate) async fn run(
     if should_stash && file_not_staged(&config_file).await? {
         writeln!(
             printer.stderr(),
-            indoc!(
-                "Your prefligit configuration file is not staged.
-                Run `git add {}` to fix this."
-            ),
-            &config_file.user_display()
+            "{} prefligit configuration file is not staged, run `{}` to stage it",
+            "error:".red(),
+            format!("git add {}", config_file.user_display()).dimmed(),
         )?;
         return Ok(ExitStatus::Failure);
     }
@@ -90,7 +87,10 @@ pub(crate) async fn run(
     let reporter = HookInitReporter::from(printer);
 
     let lock = store.lock_async().await?;
-    let hooks = project.init_hooks(&store, Some(&reporter)).await?;
+    let hooks = project
+        .init_hooks(&store, Some(&reporter))
+        .await
+        .context("Failed to initialize hooks")?;
 
     let hooks: Vec<_> = hooks
         .into_iter()
@@ -159,7 +159,11 @@ pub(crate) async fn run(
     // Clear any unstaged changes from the git working directory.
     let mut _guard = None;
     if should_stash {
-        _guard = Some(WorkTreeKeeper::clean(&store).await?);
+        _guard = Some(
+            WorkTreeKeeper::clean(&store)
+                .await
+                .context("Failed to clean work tree")?,
+        );
     }
 
     let filenames = collect_files(CollectOptions {
@@ -170,13 +174,15 @@ pub(crate) async fn run(
         files,
         commit_msg_filename: extra_args.commit_msg_filename.clone(),
     })
-    .await?;
+    .await
+    .context("Failed to collect files")?;
 
     let filter = FileFilter::new(
         &filenames,
         project.config().files.as_deref(),
         project.config().exclude.as_deref(),
-    )?;
+    )
+    .context("Failed to filter files")?;
     trace!("Files after filtered: {}", filter.len());
 
     run_hooks(

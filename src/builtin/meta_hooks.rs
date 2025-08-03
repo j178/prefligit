@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
@@ -27,7 +27,10 @@ pub(crate) async fn check_hooks_apply(
 
     for filename in filenames {
         let mut project = Project::from_config_file(Some(PathBuf::from(filename)))?;
-        let hooks = project.init_hooks(&store, None).await?;
+        let hooks = project
+            .init_hooks(&store, None)
+            .await
+            .context("Failed to init hooks")?;
 
         let filter = FileFilter::new(
             &input,
@@ -105,7 +108,10 @@ pub(crate) async fn check_useless_excludes(
             )?;
         }
 
-        let hooks = project.init_hooks(&store, None).await?;
+        let hooks = project
+            .init_hooks(&store, None)
+            .await
+            .context("Failed to init hooks")?;
 
         let filter = FileFilter::new(
             &input,

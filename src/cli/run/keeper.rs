@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use anstream::eprintln;
 use anyhow::Result;
 use owo_colors::OwoColorize;
-use tracing::{error, trace};
+use tracing::{debug, error, trace};
 
 use constants::env_vars::EnvVars;
 
@@ -88,7 +88,7 @@ impl WorkingTreeKeeper {
             .await?;
 
         if output.status.success() {
-            trace!("No non-staged changes detected");
+            debug!("No non-staged changes detected");
             // No non-staged changes
             Ok(Self(None))
         } else if output.status.code() == Some(1) {
